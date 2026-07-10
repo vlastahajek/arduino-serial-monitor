@@ -1,0 +1,16 @@
+# Maven build output
+target/
+
+# Native packaging output (jpackage)
+dist/
+
+# Local tooling and working notes — not part of the distributable project
+.claude/
+.superpowers/
+docs/
+CLAUDE.md
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~

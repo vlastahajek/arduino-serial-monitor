@@ -1,0 +1,129 @@
+name: Build native packages
+
+# Builds self-contained native installers for macOS, Windows and Linux.
+# jpackage can only build for the OS it runs on, so this fans out over a
+# matrix. Push a tag like v1.0.0 to build and attach installers to a GitHub
+# Release; use the manual trigger to just build downloadable artifacts.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            type: dmg
+            icon: icon/SerialMonitor.icns
+            extra: ""
+          - os: windows-latest
+            type: msi
+            icon: icon/SerialMonitor.ico
+            extra: '--win-menu --win-menu-group "Serial Monitor" --win-shortcut --win-dir-chooser'
+          - os: ubuntu-latest
+            type: deb
+            icon: icon/SerialMonitor.png
+            extra: "--linux-package-name serial-monitor"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 21+ is required for the `--compress zip-6` jlink syntax.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # jpackage needs the WiX 3 toolset (candle/light) to build an .msi. It is
+      # preinstalled on windows-latest; just make sure its bin is on PATH.
+      - name: Put WiX 3 on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = (Get-ChildItem "C:\Program Files (x86)\WiX Toolset v3*\bin" -ErrorAction SilentlyContinue |
+                  Select-Object -First 1).FullName
+          if ($bin) {
+            Add-Content -Path $env:GITHUB_PATH -Value $bin
+            Write-Host "WiX bin on PATH: $bin"
+          } else {
+            Write-Host "WiX v3 bin not found; relying on jpackage's default lookup"
+          }
+
+      - name: Build shaded jar
+        shell: bash
+        run: mvn -B -ntp clean package
+
+      - name: Build slim runtime and native package
+        shell: bash
+        run: |
+          rm -rf target/jpackage-input target/runtime dist
+          mkdir -p target/jpackage-input dist
+          cp target/serial-monitor-1.0.0.jar target/jpackage-input/
+          jlink --add-modules java.base,java.desktop,java.prefs \
+                --strip-debug --no-header-files --no-man-pages \
+                --compress zip-6 --output target/runtime
+          jpackage --type ${{ matrix.type }} --name SerialMonitor \
+                   --app-version 1.0.0 --vendor "Vlastimil Hajek" \
+                   --copyright "© 2026 Vlastimil Hajek" \
+                   --description "Standalone serial monitor and plotter for Arduino and other serial devices" \
+                   --about-url "https://github.com/vlastahajek/arduino-serial-monitor" \
+                   --input target/jpackage-input \
+                   --main-jar serial-monitor-1.0.0.jar \
+                   --main-class cc.arduino.serialmonitor.SerialMonitorApp \
+                   --icon ${{ matrix.icon }} \
+                   --runtime-image target/runtime \
+                   --dest dist ${{ matrix.extra }}
+
+      # Portable, no-install archive (a jpackage app-image) for Windows and
+      # Linux, alongside the installer. tar.gz on Linux preserves the launcher's
+      # executable bit, which a zip would drop.
+      - name: Build portable archive (Windows/Linux)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          rm -rf target/appimage
+          jpackage --type app-image --name SerialMonitor --app-version 1.0.0 \
+                   --vendor "Vlastimil Hajek" \
+                   --copyright "© 2026 Vlastimil Hajek" \
+                   --description "Standalone serial monitor and plotter for Arduino and other serial devices" \
+                   --input target/jpackage-input \
+                   --main-jar serial-monitor-1.0.0.jar \
+                   --main-class cc.arduino.serialmonitor.SerialMonitorApp \
+                   --icon ${{ matrix.icon }} \
+                   --runtime-image target/runtime --dest target/appimage
+          cd target/appimage
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "$GITHUB_WORKSPACE/dist/serial-monitor-win.zip" SerialMonitor >/dev/null
+          else
+            tar czf "$GITHUB_WORKSPACE/dist/serial-monitor-linux.tar.gz" SerialMonitor
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SerialMonitor-${{ matrix.os }}
+          path: dist/*
+
+  # Single job creates the release once, after all platform builds finish, so
+  # the matrix jobs don't race each other trying to create the same release.
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          fail_on_unmatched_files: true
